@@ -26,6 +26,7 @@ internal static class Native
     public const uint VK_LEFT = 0x25;
     public const uint VK_UP = 0x26;
     public const uint VK_RIGHT = 0x27;
+    public const uint VK_DOWN = 0x28;
 
     public const int SW_MAXIMIZE = 3;
     public const int SW_RESTORE = 9;

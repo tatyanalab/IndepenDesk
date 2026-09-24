@@ -30,6 +30,10 @@ internal sealed class DesktopManager
 
     private readonly Dictionary<string, MonitorState> _monitors = new();
     private readonly HashSet<IntPtr> _hidden = new();
+
+    /// <summary>Elle taşınmış pencereler: hedef masaüstüne geçildiğinde simge durumundan
+    /// çıkarılıp açık karşılamaları gerekir (kullanıcı onları oraya bilerek koydu).</summary>
+    private readonly HashSet<IntPtr> _restoreOnShow = new();
     private readonly uint _ownPid = (uint)Environment.ProcessId;
     private readonly string _stateFile;
 
@@ -188,6 +192,7 @@ internal sealed class DesktopManager
                 {
                     if (Native.IsWindow(h)) return false;
                     _hidden.Remove(h);
+                    _restoreOnShow.Remove(h);
                     return true;
                 });
 
@@ -235,6 +240,8 @@ internal sealed class DesktopManager
                         string t = Native.GetWindowTitle(h);
                         return new WindowEntry(h, t.Length > 0 ? t : Native.GetWindowClass(h));
                     })
+                    // Set sırası rastgeledir; başlığa göre sıralamak listeyi her tazelemede sabit tutar
+                    .OrderBy(w => w.Title, StringComparer.CurrentCultureIgnoreCase)
                     .ToList();
                 desktops.Add(new DesktopEntry(i, global, i == st.Current, windows));
             }
@@ -293,6 +300,40 @@ internal sealed class DesktopManager
             SwitchToCore(st, localIndex);
     }
 
+    /// <summary>
+    /// Verilen monitörde yeni bir masaüstü açar ve pencereyi doğrudan oraya koyar
+    /// (genel bakışta pencereyi "+" kartına bırakmanın karşılığıdır). Geçiş yapılmaz:
+    /// pencere gizlenir, o masaüstüne geçildiğinde açık olarak karşılar.
+    /// Sync çağrılmaz — yeni masaüstü içi dolu olduğu için budanmaz.
+    /// </summary>
+    public void CreateDesktopWithWindow(string device, IntPtr h)
+    {
+        Sync();
+        if (!_monitors.TryGetValue(device, out var st)) return;
+        if (st.Desktops.Count >= MaxDesktopsPerMonitor) return;
+        if (!Native.IsWindow(h)) return;
+
+        string? srcDevice = null;
+        foreach (var m in _monitors.Values)
+            foreach (var set in m.Desktops)
+                if (set.Remove(h))
+                    srcDevice = m.Device;
+
+        if (srcDevice != null && srcDevice != device)
+            RepositionWindow(h, srcDevice, device);
+
+        AddDesktop(st);
+        int target = st.Desktops.Count - 1;
+        st.Desktops[target].Add(h);
+        st.LastActive[target] = h;
+        _restoreOnShow.Add(h);
+
+        if (Native.IsWindowVisible(h) && Native.ShowWindow(h, Native.SW_HIDE))
+            _hidden.Add(h);
+
+        PersistHidden();
+    }
+
     /// <summary>Verilen monitörde yeni boş masaüstü oluşturur ve ona geçer.</summary>
     public void CreateDesktopAndSwitch(string device)
     {
@@ -327,7 +368,10 @@ internal sealed class DesktopManager
         foreach (var h in st.Desktops[target].ToList())
         {
             if (!Native.IsWindow(h)) { st.Desktops[target].Remove(h); continue; }
-            Native.ShowWindow(h, Native.SW_SHOWNA);
+            if (_restoreOnShow.Remove(h) && Native.IsIconic(h))
+                Native.ShowWindow(h, Native.SW_RESTORE);   // buraya taşınmıştı: açık karşılasın
+            else
+                Native.ShowWindow(h, Native.SW_SHOWNA);
             _hidden.Remove(h);
         }
 
@@ -341,6 +385,78 @@ internal sealed class DesktopManager
         PruneTrailingEmpty(st);
         PersistHidden();
         DesktopSwitched?.Invoke(BuildInfo(st));
+    }
+
+    /// <summary>Monitörün aktif masaüstündeki pencereleri gösterir, diğerlerini gizler.
+    /// Yapı dışarıdan değiştikten sonra (masaüstü kapatma gibi) görünürlüğü invariant'a döndürür.</summary>
+    private void ApplyVisibility(MonitorState st)
+    {
+        for (int i = 0; i < st.Desktops.Count; i++)
+            foreach (var h in st.Desktops[i].ToList())
+            {
+                if (!Native.IsWindow(h)) { st.Desktops[i].Remove(h); _hidden.Remove(h); continue; }
+                if (i == st.Current)
+                {
+                    if (!Native.IsWindowVisible(h)) Native.ShowWindow(h, Native.SW_SHOWNA);
+                    _hidden.Remove(h);
+                }
+                else if (Native.IsWindowVisible(h) && Native.ShowWindow(h, Native.SW_HIDE))
+                {
+                    _hidden.Add(h);
+                }
+            }
+    }
+
+    /// <summary>Bir masaüstünü kapatır; üzerindeki pencereler komşu masaüstüne taşınır
+    /// (varsa önceki, yoksa sonraki) — hiçbir pencere kaybolmaz. Monitörün tek masaüstü kapatılmaz.</summary>
+    public void CloseDesktop(string device, int local)
+    {
+        Sync();
+        if (!_monitors.TryGetValue(device, out var st)) return;
+        if (st.Desktops.Count <= 1) return;
+        if (local < 0 || local >= st.Desktops.Count) return;
+
+        int target = local > 0 ? local - 1 : 1;
+        foreach (var h in st.Desktops[local])
+        {
+            st.Desktops[target].Add(h);
+            if (st.LastActive[local] == h) st.LastActive[target] = h;
+        }
+
+        var current = st.Desktops[st.Current];
+        bool closingCurrent = st.Current == local;
+
+        st.Desktops.RemoveAt(local);
+        st.LastActive.RemoveAt(local);
+
+        st.Current = closingCurrent ? Math.Max(0, local - 1) : st.Desktops.IndexOf(current);
+
+        ApplyVisibility(st);
+        PruneTrailingEmpty(st);
+        PersistHidden();
+        DesktopSwitched?.Invoke(BuildInfo(st));
+    }
+
+    /// <summary>Pencereyi bulunduğu masaüstüne geçerek öne getirir; simge durumundaysa geri yükler.
+    /// (Genel bakışta bir pencereye tıklamanın karşılığıdır.)</summary>
+    public void ActivateWindow(IntPtr h)
+    {
+        Sync();
+        if (!Native.IsWindow(h)) return;
+
+        foreach (var st in _monitors.Values)
+            for (int i = 0; i < st.Desktops.Count; i++)
+            {
+                if (!st.Desktops[i].Contains(h)) continue;
+
+                if (st.Current != i) SwitchToCore(st, i);
+                if (Native.IsIconic(h)) Native.ShowWindow(h, Native.SW_RESTORE);
+                else if (!Native.IsWindowVisible(h)) Native.ShowWindow(h, Native.SW_SHOWNA);
+                _hidden.Remove(h);
+                st.LastActive[i] = h;
+                Native.SetForegroundWindow(h);
+                return;
+            }
     }
 
     // ---------- pencere ve masaüstü taşıma ----------
@@ -390,28 +506,49 @@ internal sealed class DesktopManager
 
         dst.Desktops[dstLocal].Add(h);
 
+        // Elle taşınan pencere hedefte açık karşılamalı: aktif masaüstüne bırakıldıysa hemen,
+        // değilse o masaüstüne geçildiğinde simge durumundan çıkarılır.
         if (dst.Current == dstLocal)
         {
-            if (!Native.IsWindowVisible(h)) Native.ShowWindow(h, Native.SW_SHOWNA);
+            if (Native.IsIconic(h)) Native.ShowWindow(h, Native.SW_RESTORE);
+            else if (!Native.IsWindowVisible(h)) Native.ShowWindow(h, Native.SW_SHOWNA);
             _hidden.Remove(h);
+            _restoreOnShow.Remove(h);
         }
-        else if (Native.IsWindowVisible(h) && Native.ShowWindow(h, Native.SW_HIDE))
+        else
         {
-            _hidden.Add(h);
+            _restoreOnShow.Add(h);
+            if (Native.IsWindowVisible(h) && Native.ShowWindow(h, Native.SW_HIDE))
+                _hidden.Add(h);
         }
 
         foreach (var st in _monitors.Values) PruneTrailingEmpty(st);
         PersistHidden();
     }
 
-    /// <summary>Bir masaüstünü tüm pencereleriyle başka monitöre taşır (sonuna eklenir).</summary>
-    public void MoveDesktopToMonitor(string srcDevice, int srcLocal, string dstDevice)
+    /// <summary>Bir masaüstünü tüm pencereleriyle başka monitörün sonuna taşır.</summary>
+    public void MoveDesktopToMonitor(string srcDevice, int srcLocal, string dstDevice) =>
+        MoveDesktop(srcDevice, srcLocal, dstDevice, -1);
+
+    /// <summary>
+    /// Bir masaüstünü tüm pencereleriyle hedef monitörde belirli bir konuma taşır.
+    /// <paramref name="dstIndex"/> hedef listedeki ekleme konumudur (kaynak çıkarılmadan
+    /// önceki numaralandırmaya göre); -1 sona ekler. Kaynak ve hedef aynı monitör ise
+    /// masaüstü yalnızca yeniden sıralanır, pencereler gizlenip gösterilmez.
+    /// </summary>
+    public void MoveDesktop(string srcDevice, int srcLocal, string dstDevice, int dstIndex)
     {
         Sync();
-        if (srcDevice == dstDevice) return;
         if (!_monitors.TryGetValue(srcDevice, out var src)) return;
         if (!_monitors.TryGetValue(dstDevice, out var dst)) return;
         if (srcLocal < 0 || srcLocal >= src.Desktops.Count) return;
+
+        if (srcDevice == dstDevice)
+        {
+            ReorderDesktop(src, srcLocal, dstIndex);
+            return;
+        }
+
         if (dst.Desktops.Count >= MaxDesktopsPerMonitor) return;
 
         var set = src.Desktops[srcLocal];
@@ -433,8 +570,10 @@ internal sealed class DesktopManager
                 _hidden.Add(h);
         }
 
-        dst.Desktops.Add(set);
-        dst.LastActive.Add(last);
+        int at = dstIndex < 0 ? dst.Desktops.Count : Math.Clamp(dstIndex, 0, dst.Desktops.Count);
+        dst.Desktops.Insert(at, set);
+        dst.LastActive.Insert(at, last);
+        if (dst.Current >= at) dst.Current++;   // aktif masaüstü kaydıysa index'i düzelt
 
         // Kaynak monitörde aktif masaüstü taşındıysa kalan aktif masaüstünü görünür yap
         if (wasCurrent)
@@ -447,6 +586,29 @@ internal sealed class DesktopManager
 
         PruneTrailingEmpty(src);
         PersistHidden();
+    }
+
+    /// <summary>
+    /// Aynı monitörde masaüstünün sırasını değiştirir. Pencereler yerinde kalır; yalnızca
+    /// kartların sırası ve global numaralar değişir. Aktif masaüstü set referansıyla
+    /// izlenir, böylece sıralama sonrası yanlış pencereler gizlenmez.
+    /// </summary>
+    private static void ReorderDesktop(MonitorState st, int srcLocal, int dstIndex)
+    {
+        int target = dstIndex < 0 ? st.Desktops.Count : Math.Clamp(dstIndex, 0, st.Desktops.Count);
+        if (target > srcLocal) target--;   // kaynak çıkarıldıktan sonraki konum
+        if (target == srcLocal) return;
+
+        var set = st.Desktops[srcLocal];
+        var last = st.LastActive[srcLocal];
+        var current = st.Desktops[st.Current];
+
+        st.Desktops.RemoveAt(srcLocal);
+        st.LastActive.RemoveAt(srcLocal);
+        st.Desktops.Insert(target, set);
+        st.LastActive.Insert(target, last);
+
+        st.Current = st.Desktops.IndexOf(current);
     }
 
     /// <summary>Pencereyi kaynak monitördeki göreli konumunu koruyarak hedef monitöre taşır.</summary>
