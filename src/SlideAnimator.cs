@@ -8,14 +8,38 @@ namespace IndepenDesk;
 /// görüntü katmanın İÇİNDE geçiş yönüne göre kayar ve boşalan bölge şeffaflaşarak yeni
 /// masaüstünü ortaya çıkarır. Katman monitör sınırları dışına asla taşmaz.
 /// </summary>
+internal enum TransitionMode { Fade, Slide, None }
+
 internal sealed class SlideAnimator : IDisposable
 {
     private readonly Dictionary<string, SlideOverlay> _active = new();
+
+    /// <summary>Geçiş efekti tercihi; tray menüsünden değiştirilir, settings.json'da saklanır.</summary>
+    public static TransitionMode Mode { get; private set; } =
+        SettingsStore.GetString("animation") switch
+        {
+            "slide" => TransitionMode.Slide,
+            "fade" => TransitionMode.Fade,
+            _ => TransitionMode.None   // varsayılan: efekt yok, geçiş anında olur
+        };
+
+    public static void SetMode(TransitionMode mode)
+    {
+        Mode = mode;
+        SettingsStore.SetString("animation", mode switch
+        {
+            TransitionMode.Slide => "slide",
+            TransitionMode.None => "none",
+            _ => "fade"
+        });
+    }
 
     /// <summary>Geçiş başlamadan çağrılır: mevcut görüntüyü yakalar ve katmanı gösterir.</summary>
     public void Begin(string device, int direction)
     {
         Cancel(device);
+        if (Mode == TransitionMode.None) return;
+
         var screen = Screen.AllScreens.FirstOrDefault(s => s.DeviceName == device);
         if (screen == null) return;
 
@@ -26,7 +50,7 @@ internal sealed class SlideAnimator : IDisposable
             using (var g = Graphics.FromImage(shot))
                 g.CopyFromScreen(b.Left, b.Top, 0, 0, b.Size);
 
-            var overlay = new SlideOverlay(b, shot, direction);
+            var overlay = new SlideOverlay(b, shot, direction, Mode);
             overlay.Completed += (_, _) =>
             {
                 if (_active.TryGetValue(device, out var o) && o == overlay)
@@ -59,12 +83,14 @@ internal sealed class SlideAnimator : IDisposable
 
     private sealed class SlideOverlay : Form
     {
-        private const int DurationMs = 230;
-        private const int PaintDelayMs = 60; // yeni pencerelerin altta çizilmesi için kısa bekleme
+        private const int SlideMs = 230;
+        private const int FadeMs = 170;
+        private const int PaintDelayMs = 40; // yeni pencerelerin altta çizilmesi için kısa bekleme
 
         private readonly Bitmap _shot;
         private readonly int _direction; // +1: ileri geçiş → görüntü sola kayar, -1: tersi
-        private readonly System.Windows.Forms.Timer _timer = new() { Interval = 10 };
+        private readonly TransitionMode _mode;
+        private readonly System.Windows.Forms.Timer _timer = new() { Interval = 15 };
         private readonly Stopwatch _clock = new();
         private int _paintDelay = PaintDelayMs;
         private int _imageX;
@@ -72,10 +98,11 @@ internal sealed class SlideAnimator : IDisposable
 
         public event EventHandler? Completed;
 
-        public SlideOverlay(Rectangle bounds, Bitmap shot, int direction)
+        public SlideOverlay(Rectangle bounds, Bitmap shot, int direction, TransitionMode mode)
         {
             _shot = shot;
             _direction = direction;
+            _mode = mode;
 
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
                      ControlStyles.OptimizedDoubleBuffer, true);
@@ -118,21 +145,30 @@ internal sealed class SlideAnimator : IDisposable
                 return;
             }
 
-            double t = Math.Min(1.0, _clock.ElapsedMilliseconds / (double)DurationMs);
-            double eased = 1 - Math.Pow(1 - t, 3); // ease-out cubic
-            int offset = (int)(eased * Width);
+            int duration = _mode == TransitionMode.Slide ? SlideMs : FadeMs;
+            double t = Math.Min(1.0, _clock.ElapsedMilliseconds / (double)duration);
 
-            // Görüntü katmanın içinde kayar; boşalan şerit bölge dışına alınır (şeffaflaşır),
-            // böylece alttaki gerçek yeni masaüstü görünür. Katman kendisi hiç hareket etmez.
-            if (_direction > 0)
+            if (_mode == TransitionMode.Slide)
             {
-                _imageX = -offset;
-                Region = new Region(new Rectangle(0, 0, Math.Max(0, Width - offset), Height));
+                double eased = 1 - Math.Pow(1 - t, 3); // ease-out cubic
+                int offset = (int)(eased * Width);
+
+                // Görüntü katmanın içinde kayar; boşalan şerit bölge dışına alınır (şeffaflaşır),
+                // böylece alttaki gerçek yeni masaüstü görünür. Katman kendisi hiç hareket etmez.
+                var shown = _direction > 0
+                    ? new Rectangle(0, 0, Math.Max(0, Width - offset), Height)
+                    : new Rectangle(offset, 0, Math.Max(0, Width - offset), Height);
+                _imageX = _direction > 0 ? -offset : offset;
+
+                var previous = Region;      // Region ataması eskisini serbest bırakmaz
+                Region = new Region(shown);
+                previous?.Dispose();
             }
             else
             {
-                _imageX = offset;
-                Region = new Region(new Rectangle(offset, 0, Math.Max(0, Width - offset), Height));
+                // Eski masaüstünün görüntüsü yumuşakça saydamlaşır; yön oyunu olmadığı için
+                // tek yönlü kaymanın yarattığı "perde" hissi oluşmaz.
+                Opacity = 1.0 - t * t * (3 - 2 * t); // smoothstep
             }
             Invalidate();
 

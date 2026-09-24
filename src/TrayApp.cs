@@ -8,6 +8,8 @@ internal sealed class TrayApp : ApplicationContext
     private const int HkMovePrev = 3;
     private const int HkMoveNext = 4;
     private const int HkOverview = 5;
+    private const int HkCloseOverview = 6;
+    private const int HkCloseOverviewAlt = 7;
     private const int HkDesktopBase = 10; // 10..18 => global masaüstü 1..9
 
     private readonly DesktopManager _manager = new();
@@ -16,6 +18,9 @@ internal sealed class TrayApp : ApplicationContext
     private readonly SlideAnimator _animator = new();
     private readonly HotkeyWindow _hotkeys;
     private readonly System.Windows.Forms.Timer _syncTimer = new() { Interval = 600 };
+
+    /// <summary>Kaydedilemeyen kısayollar; menüde görünür ki jestin neden çalışmadığı anlaşılsın.</summary>
+    private readonly List<string> _failedHotkeys = new();
 
     public TrayApp()
     {
@@ -43,6 +48,7 @@ internal sealed class TrayApp : ApplicationContext
         };
 
         RegisterHotkeys();
+        if (_failedHotkeys.Count > 0) BuildMenu();   // menüye uyarı satırını ekle
 
         _manager.Sync();
         _syncTimer.Tick += (_, _) => { if (!OverviewForm.IsOpen) _manager.Sync(); };
@@ -79,6 +85,21 @@ internal sealed class TrayApp : ApplicationContext
         }
         menu.Items.Add(langMenu);
 
+        var animMenu = new ToolStripMenuItem(L.T("menu.anim"));
+        foreach (var (mode, key) in new[]
+                 {
+                     (TransitionMode.None, "menu.anim.off"),
+                     (TransitionMode.Fade, "menu.anim.fade"),
+                     (TransitionMode.Slide, "menu.anim.slide")
+                 })
+        {
+            var item = new ToolStripMenuItem(L.T(key)) { Checked = SlideAnimator.Mode == mode };
+            var m = mode;
+            item.Click += (_, _) => { SlideAnimator.SetMode(m); BuildMenu(); };
+            animMenu.DropDownItems.Add(item);
+        }
+        menu.Items.Add(animMenu);
+
         // MSIX'te başlangıç Windows Ayarları'ndan yönetilir; menü öğesi o sayfayı açar.
         var startupItem = new ToolStripMenuItem(L.T("menu.startup"));
         if (StartupManager.IsPackaged)
@@ -95,6 +116,13 @@ internal sealed class TrayApp : ApplicationContext
 
         menu.Items.Add(L.T("menu.update"), null, async (_, _) =>
             await UpdateChecker.CheckAndNotifyAsync(new WindowWrapper(_hotkeys.Handle)));
+        if (_failedHotkeys.Count > 0)
+        {
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(new ToolStripMenuItem(
+                L.T("msg.hotkeyFail") + string.Join(", ", _failedHotkeys)) { Enabled = false });
+        }
+
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(L.T("menu.exit"), null, (_, _) => ExitThread());
 
@@ -112,6 +140,13 @@ internal sealed class TrayApp : ApplicationContext
             case HkMovePrev: _manager.MoveActiveWindow(-1); break;
             case HkMoveNext: _manager.MoveActiveWindow(+1); break;
             case HkOverview: OverviewForm.Toggle(_manager); break;
+            // Klavyeden kapatma. Genel bakış açıkken Windows dokunmatik yüzey jestlerine atanmış
+            // kısayolları iletmediği için jestle kapatma çalışmaz; panelde boş alana tıklamak veya
+            // Esc kapatır.
+            case HkCloseOverview:
+            case HkCloseOverviewAlt:
+                if (OverviewForm.IsOpen) OverviewForm.Toggle(_manager);
+                break;
             default:
                 if (id >= HkDesktopBase && id < HkDesktopBase + 9)
                     _manager.SwitchToGlobal(id - HkDesktopBase + 1);
@@ -121,7 +156,8 @@ internal sealed class TrayApp : ApplicationContext
 
     private void RegisterHotkeys()
     {
-        var failed = new List<string>();
+        var failed = _failedHotkeys;
+        failed.Clear();
         void Reg(int id, uint mods, uint vk, string label)
         {
             if (!Native.RegisterHotKey(_hotkeys.Handle, id, mods | Native.MOD_NOREPEAT, vk))
@@ -132,6 +168,10 @@ internal sealed class TrayApp : ApplicationContext
         Reg(HkPrev, ca, Native.VK_LEFT, "Ctrl+Alt+←");
         Reg(HkNext, ca, Native.VK_RIGHT, "Ctrl+Alt+→");
         Reg(HkOverview, ca, Native.VK_UP, "Ctrl+Alt+↑");
+        // Aşağı yön için iki kısayol: Ctrl+Alt+↓ başka bir uygulama tarafından kapılmış olabilir,
+        // o yüzden Shift'li varyant da kaydedilir ve jest hangisine atanırsa ona çalışır.
+        Reg(HkCloseOverview, ca, Native.VK_DOWN, "Ctrl+Alt+↓");
+        Reg(HkCloseOverviewAlt, ca | Native.MOD_SHIFT, Native.VK_DOWN, "Ctrl+Alt+Shift+↓");
         Reg(HkMovePrev, ca | Native.MOD_SHIFT, Native.VK_LEFT, "Ctrl+Alt+Shift+←");
         Reg(HkMoveNext, ca | Native.MOD_SHIFT, Native.VK_RIGHT, "Ctrl+Alt+Shift+→");
         for (int i = 0; i < 9; i++)
