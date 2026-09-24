@@ -4,6 +4,10 @@
 
 **Independent virtual desktops per monitor for Windows** — the Windows counterpart of macOS "Displays have separate Spaces".
 
+> **This is a fork** of [harungecit/IndepenDesk](https://github.com/harungecit/IndepenDesk) with a reworked
+> Overview panel: desktops can be reordered and closed, cards list every window, clicking a window jumps to it.
+> See [FORK.md](FORK.md) for the full list and the reasoning.
+
 ## The problem
 
 Windows virtual desktops are global: pressing `Win+Ctrl+←/→` switches **all monitors at once**. On macOS every display has its own Spaces and only the display under the cursor switches. IndepenDesk brings that behavior to Windows.
